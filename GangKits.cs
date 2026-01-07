@@ -255,14 +255,21 @@ namespace Oxide.Plugins
         {
             // Check if slot is occupied by a NON-gang-kit item
             // Gang kit items don't count as "occupied" since they can be replaced
-            return player.inventory.containerWear.itemList.Any(item => 
+            bool hasNonKitInWear = player.inventory.containerWear.itemList.Any(item => 
                 item.info.shortname == shortname && item.name != "GANG_KIT_ITEM");
+            
+            // Also check if gang kit clothing is in main inventory (player moved it there)
+            bool hasKitInMain = player.inventory.containerMain.itemList.Any(item =>
+                item.info.shortname == shortname && item.name == "GANG_KIT_ITEM");
+            
+            return hasNonKitInWear || hasKitInMain;
         }
 
         private bool HasWeapon(BasePlayer player, string shortname)
         {
-            // Check if player has this weapon (either kit or non-kit version)
-            return player.inventory.containerBelt.itemList.Any(i => i.info.shortname == shortname);
+            // Check if player has this weapon (either kit or non-kit version) in belt or main inventory
+            return player.inventory.containerBelt.itemList.Any(i => i.info.shortname == shortname) ||
+                   player.inventory.containerMain.itemList.Any(i => i.info.shortname == shortname && i.name == "GANG_KIT_WEAPON");
         }
         
         private bool HasGangKitWeapon(BasePlayer player, string shortname)
