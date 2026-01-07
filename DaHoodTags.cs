@@ -139,7 +139,7 @@ namespace Oxide.Plugins
             public string Timestamp { get; set; }
             public string TaggerGang { get; set; }
             public string TerritoryGang { get; set; }
-            public uint EntityId { get; set; }
+            public ulong EntityId { get; set; }
         }
 
         // Territory definitions (matching HoodWars)
@@ -343,7 +343,7 @@ namespace Oxide.Plugins
 
         #region Tag Processing & Alerts
 
-        private void ProcessTagPlacement(BasePlayer player, Vector3 position, uint entityId)
+        private void ProcessTagPlacement(BasePlayer player, Vector3 position, ulong entityId)
         {
             GangType playerGang = GetPlayerGang(player);
             if (playerGang == GangType.None) return;
@@ -459,7 +459,7 @@ namespace Oxide.Plugins
             }
         }
 
-        private void TrackTag(BasePlayer player, Vector3 position, GangType playerGang, GangType territoryGang, uint entityId)
+        private void TrackTag(BasePlayer player, Vector3 position, GangType playerGang, GangType territoryGang, ulong entityId)
         {
             if (!_tagData.PlayerTags.ContainsKey(player.userID))
                 _tagData.PlayerTags[player.userID] = new List<TagRecord>();
