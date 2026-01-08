@@ -329,12 +329,64 @@ namespace Oxide.Plugins
             player.inventory.Strip();
             SendReply(player, "<color=#ffff00>ADMIN:</color> Clearing inventory and spawning all 4 Gang Kits for testing...");
 
-            foreach (var gang in _kits.Keys)
+            // Give all kits directly to main inventory for testing (bypasses normal kit logic)
+            int totalItems = 0;
+            foreach (var kvp in _kits)
             {
-                GiveGangKit(player, gang);
+                string gangName = kvp.Key;
+                GangKit kit = kvp.Value;
+                
+                SendReply(player, $"<color=#aaaaaa>Adding {gangName} kit...</color>");
+                
+                // Add clothing items to main inventory
+                foreach (var shortname in kit.Clothing)
+                {
+                    ulong skin = kit.Skins.ContainsKey(shortname) ? kit.Skins[shortname] : 0;
+                    Item item = ItemManager.CreateByName(shortname, 1, skin);
+                    if (item != null)
+                    {
+                        item.name = $"TEST_{gangName}"; // Mark as test item, not GANG_KIT_ITEM
+                        if (item.MoveToContainer(player.inventory.containerMain))
+                        {
+                            totalItems++;
+                        }
+                        else
+                        {
+                            item.Remove();
+                            Puts($"[DEBUG] CmdTestAllKits: Failed to give {shortname} for {gangName}");
+                        }
+                    }
+                }
+                
+                // Add weapon to main inventory
+                Item weapon = ItemManager.CreateByName(kit.Weapon, 1, kit.WeaponSkin);
+                if (weapon != null)
+                {
+                    weapon.name = $"TEST_{gangName}"; // Mark as test item
+                    BaseProjectile proj = weapon.GetHeldEntity() as BaseProjectile;
+                    if (proj != null)
+                    {
+                        proj.primaryMagazine.contents = 0;
+                        proj.SendNetworkUpdate();
+                    }
+
+                    if (weapon.MoveToContainer(player.inventory.containerMain))
+                    {
+                        totalItems++;
+                    }
+                    else if (weapon.MoveToContainer(player.inventory.containerBelt))
+                    {
+                        totalItems++;
+                    }
+                    else
+                    {
+                        weapon.Remove();
+                        Puts($"[DEBUG] CmdTestAllKits: Failed to give weapon for {gangName}");
+                    }
+                }
             }
             
-            SendReply(player, "Check your inventory. All kits have been spawned.");
+            SendReply(player, $"<color=#66ff66>Done!</color> Spawned {totalItems} items from all 4 gang kits. Check your main inventory.");
         }
 
         #endregion
