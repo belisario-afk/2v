@@ -1,18 +1,19 @@
 using System.Collections.Generic;
 using System.Linq;
+using Oxide.Core;
 using Oxide.Core.Plugins;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("GangKits", "Gemini", "1.7.0")]
+    [Info("GangKits", "Gemini", "1.8.0")]
     [Description("Automatic permanent gang outfits and weapons. Includes admin testing tools.")]
     public class GangKits : RustPlugin
     {
         // Track gang kit weapons dropped on ground (to clean up)
         private HashSet<uint> _droppedKitItems = new HashSet<uint>();
         
-        // Track which gang each player is blooded into (persists across deaths)
+        // Track which gang each player is blooded into (persists across deaths AND server restarts)
         private Dictionary<ulong, string> _playerGangs = new Dictionary<ulong, string>();
         
         // Track wounded players to prevent kit loss on DBNO (down but not out)
@@ -20,6 +21,9 @@ namespace Oxide.Plugins
         
         // Track players currently getting kit (to prevent re-entry)
         private HashSet<ulong> _givingKit = new HashSet<ulong>();
+        
+        // Data file for persisting player gang assignments
+        private const string DataFileName = "GangKits_PlayerGangs";
         
         [PluginReference]
         private Plugin HoodWars;
@@ -111,6 +115,59 @@ namespace Oxide.Plugins
                     WeaponSkin = ulong.Parse(data["WeaponSkin"].ToString())
                 };
             }
+            
+            // Load saved player gang data
+            LoadPlayerGangData();
+        }
+        
+        private void Unload()
+        {
+            // Save player gang data when plugin unloads
+            SavePlayerGangData();
+        }
+        
+        private void OnServerSave()
+        {
+            // Save player gang data periodically with server saves
+            SavePlayerGangData();
+        }
+        
+        private void LoadPlayerGangData()
+        {
+            try
+            {
+                var data = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, string>>(DataFileName);
+                if (data != null)
+                {
+                    _playerGangs.Clear();
+                    foreach (var kvp in data)
+                    {
+                        if (ulong.TryParse(kvp.Key, out ulong playerId))
+                        {
+                            _playerGangs[playerId] = kvp.Value;
+                        }
+                    }
+                    Puts($"[GangKits] Loaded {_playerGangs.Count} player gang assignments from data file.");
+                }
+            }
+            catch
+            {
+                Puts("[GangKits] No existing player gang data found, starting fresh.");
+            }
+        }
+        
+        private void SavePlayerGangData()
+        {
+            try
+            {
+                var data = _playerGangs.ToDictionary(kvp => kvp.Key.ToString(), kvp => kvp.Value);
+                Interface.Oxide.DataFileSystem.WriteObject(DataFileName, data);
+                Puts($"[GangKits] Saved {_playerGangs.Count} player gang assignments to data file.");
+            }
+            catch (System.Exception ex)
+            {
+                Puts($"[GangKits] ERROR saving player gang data: {ex.Message}");
+            }
         }
 
         #endregion
@@ -124,6 +181,7 @@ namespace Oxide.Plugins
             if (!string.IsNullOrEmpty(gangName) && gangName != "Neutral" && gangName != "Neutral Ground")
             {
                 _playerGangs[playerId] = gangName;
+                SavePlayerGangData(); // Persist immediately
                 Puts($"[DEBUG] Player {playerId} registered to gang: {gangName}");
             }
         }
@@ -143,6 +201,7 @@ namespace Oxide.Plugins
             if (!string.IsNullOrEmpty(gangName) && gangName != "Neutral" && gangName != "Neutral Ground")
             {
                 _playerGangs[player.userID] = gangName;
+                SavePlayerGangData(); // Persist immediately
             }
             
             GiveGangKit(player, gangName);
@@ -150,7 +209,7 @@ namespace Oxide.Plugins
 
         private void GiveGangKit(BasePlayer player, string forcedGang = null)
         {
-            if (player == null) 
+            if (player == null)
             {
                 Puts("[DEBUG] GiveGangKit: player is null, aborting.");
                 return;
@@ -392,6 +451,27 @@ namespace Oxide.Plugins
         #endregion
 
         #region Hooks
+
+        // When player connects to server (includes reconnects)
+        private void OnPlayerConnected(BasePlayer player)
+        {
+            if (player == null) return;
+            Puts($"[DEBUG] OnPlayerConnected: {player.displayName}");
+            
+            // Give kit on connect with a delay to ensure player is fully loaded
+            timer.Once(2f, () => {
+                if (player == null || !player.IsConnected) return;
+                
+                string gangName = GetPlayerGang(player);
+                if (string.IsNullOrEmpty(gangName) || gangName == "Neutral" || gangName == "Neutral Ground")
+                {
+                    Puts($"[DEBUG] OnPlayerConnected: Player {player.displayName} has no gang, skipping kit");
+                    return;
+                }
+                Puts($"[DEBUG] OnPlayerConnected giving kit for gang: {gangName}");
+                GiveGangKit(player);
+            });
+        }
 
         private void OnPlayerRespawned(BasePlayer player)
         {
