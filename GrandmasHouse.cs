@@ -3,18 +3,19 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Oxide.Core;
+using Oxide.Core.Configuration;
 using Oxide.Core.Plugins;
 using UnityEngine;
 using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("GrandmasHouse", "Gemini", "2.9.1")]
-    [Description("Independent Matriarch System. Advanced clone mimicry including jumping and looking direction.")]
+    [Info("GrandmasHouse", "Gemini", "3.0.0")]
+    [Description("Grandma's House system with gang-restricted zones, doors, and matriarch NPCs.")]
     public class GrandmasHouse : RustPlugin
     {
         [PluginReference]
-        private Plugin HoodWars, TurfGraffiti;
+        private Plugin HoodWars, TurfGraffiti, ManualDoor;
 
         private Dictionary<string, MatriarchSet> _activeMatriarchs = new Dictionary<string, MatriarchSet>();
         private List<BaseEntity> _manualMatriarchs = new List<BaseEntity>();
@@ -24,9 +25,74 @@ namespace Oxide.Plugins
         private Dictionary<ulong, Queue<CaptorFrame>> _captorTrails = new Dictionary<ulong, Queue<CaptorFrame>>();
         private Dictionary<BaseEntity, float> _aimTimers = new Dictionary<BaseEntity, float>();
         
+        // Data storage for grandma house zones and doors
+        private StoredData _storedData;
+        private DynamicConfigFile _dataFile;
+        
+        // Door prefabs
+        private const string DoorSinglePrefab = "assets/prefabs/building/door.hinged/door.hinged.metal.prefab";
+        private const string DoorDoublePrefab = "assets/prefabs/building/door.double.hinged/door.double.hinged.metal.prefab";
+        private const string DoorGaragePrefab = "assets/prefabs/building/wall.frame.garagedoor/wall.frame.garagedoor.prefab";
+        private const string DoorArmoredSinglePrefab = "assets/prefabs/building/door.hinged/door.hinged.toptier.prefab";
+        private const string DoorArmoredDoublePrefab = "assets/prefabs/building/door.double.hinged/door.double.hinged.toptier.prefab";
+        private const string CodeLockPrefab = "assets/prefabs/locks/keypad/lock.code.prefab";
+        
         private const string PrefabNPC = "assets/prefabs/player/player.prefab";
         private const string PermAdmin = "grandmashouse.admin";
         private const string ItemC4 = "explosive.timed";
+
+        #region Data Classes
+        
+        private class StoredData
+        {
+            public Dictionary<string, GrandmaHouseZone> HouseZones = new Dictionary<string, GrandmaHouseZone>();
+            public Dictionary<ulong, GrandmaDoorInfo> Doors = new Dictionary<ulong, GrandmaDoorInfo>();
+        }
+        
+        private class GrandmaHouseZone
+        {
+            public string GangName;
+            public float CenterX;
+            public float CenterY;
+            public float CenterZ;
+            public float Radius = 30f;
+            public bool NoBuild = true;
+            public bool AllowRaiding = true; // Unlike HQ safezones, doors can be damaged
+        }
+        
+        private class GrandmaDoorInfo
+        {
+            public float PosX;
+            public float PosY;
+            public float PosZ;
+            public float RotX;
+            public float RotY;
+            public float RotZ;
+            public float RotW;
+            public string GangName;
+            public string DoorType; // single, double, garage, armored_single, armored_double
+            public ulong OwnerId;
+            
+            public Vector3 GetPosition() => new Vector3(PosX, PosY, PosZ);
+            public Quaternion GetRotation() => new Quaternion(RotX, RotY, RotZ, RotW);
+            
+            public void SetPosition(Vector3 pos)
+            {
+                PosX = pos.x;
+                PosY = pos.y;
+                PosZ = pos.z;
+            }
+            
+            public void SetRotation(Quaternion rot)
+            {
+                RotX = rot.x;
+                RotY = rot.y;
+                RotZ = rot.z;
+                RotW = rot.w;
+            }
+        }
+        
+        #endregion
 
         private class MatriarchSet
         {
@@ -57,6 +123,21 @@ namespace Oxide.Plugins
             public float Radius;
         }
 
+        private class HouseZoneSettings
+        {
+            [JsonProperty("Default Zone Radius")]
+            public float DefaultRadius { get; set; } = 30f;
+            
+            [JsonProperty("No Build In Zone")]
+            public bool NoBuildInZone { get; set; } = true;
+            
+            [JsonProperty("Allow Raiding (doors can be damaged)")]
+            public bool AllowRaiding { get; set; } = true;
+            
+            [JsonProperty("Gang Members Can Open All Doors")]
+            public bool GangMembersCanOpenDoors { get; set; } = true;
+        }
+
         private class ConfigData
         {
             [JsonProperty("Grandma Settings")]
@@ -76,6 +157,9 @@ namespace Oxide.Plugins
                 Name = "Mom",
                 Radius = 12f
             };
+            
+            [JsonProperty("House Zone Settings")]
+            public HouseZoneSettings HouseZone { get; set; } = new HouseZoneSettings();
 
             public int FoodGiftIntervalMinutes = 30;
             public float RepairIntervalSeconds = 10f;
@@ -91,6 +175,7 @@ namespace Oxide.Plugins
         {
             base.LoadConfig();
             _config = Config.ReadObject<ConfigData>() ?? new ConfigData();
+            if (_config.HouseZone == null) _config.HouseZone = new HouseZoneSettings();
             SaveConfig();
         }
         protected override void SaveConfig() => Config.WriteObject(_config);
@@ -102,6 +187,20 @@ namespace Oxide.Plugins
         private void Init()
         {
             permission.RegisterPermission(PermAdmin, this);
+            
+            // Load data file
+            _dataFile = Interface.Oxide.DataFileSystem.GetFile("GrandmasHouse_Data");
+            try
+            {
+                _storedData = _dataFile.ReadObject<StoredData>() ?? new StoredData();
+            }
+            catch
+            {
+                _storedData = new StoredData();
+            }
+            
+            if (_storedData.HouseZones == null) _storedData.HouseZones = new Dictionary<string, GrandmaHouseZone>();
+            if (_storedData.Doors == null) _storedData.Doors = new Dictionary<ulong, GrandmaDoorInfo>();
         }
 
         private void OnServerInitialized()
@@ -110,6 +209,9 @@ namespace Oxide.Plugins
             {
                 SpawnAllMatriarchs();
             }
+            
+            // Respawn any saved doors
+            RespawnAllDoors();
 
             timer.Every(5f, UpdateMatriarchAuras);
             timer.Every(0.03f, UpdateHostageLogic); 
@@ -126,6 +228,14 @@ namespace Oxide.Plugins
 
             foreach (var ent in _manualMatriarchs)
                 if (ent != null && !ent.IsDestroyed) ent.Kill();
+                
+            SaveData();
+        }
+        
+        private void SaveData()
+        {
+            if (_dataFile != null && _storedData != null)
+                _dataFile.WriteObject(_storedData);
         }
 
         private void SpawnAllMatriarchs()
@@ -623,6 +733,400 @@ namespace Oxide.Plugins
             if (TurfGraffiti != null) TurfGraffiti.Call("ReduceInfluence", gangOwner, penalty);
 
             timer.Once(_config.RespawnTimeSeconds, () => SpawnMatriarchAtHQ(gangOwner, wasG));
+        }
+        
+        // Block building in grandma house zones (but allow damage/raiding)
+        private object CanBuild(Planner planner, Construction prefab, Construction.Target target)
+        {
+            if (_config == null || _config.HouseZone == null || !_config.HouseZone.NoBuildInZone) return null;
+            if (planner == null) return null;
+            
+            var player = planner.GetOwnerPlayer();
+            if (player == null) return null;
+            
+            var zone = GetHouseZoneAtPosition(target.position);
+            if (zone == null) return null;
+            
+            // Get player's gang
+            string playerGang = GetPlayerGang(player);
+            
+            // Allow gang members to place some items (like doors) but block general building
+            string shortName = prefab.fullName;
+            bool isDoor = shortName.Contains("door") || shortName.Contains("garage");
+            
+            if (isDoor && playerGang == zone.GangName)
+            {
+                return null; // Gang members can place doors
+            }
+            
+            player.ChatMessage($"<color=#ff4444>NO BUILD:</color> You cannot build in {zone.GangName}'s Grandma's house zone.");
+            return false;
+        }
+        
+        // Gang-based door access control - Oxide hook for door locks
+        private object OnDoorOpened(Door door, BasePlayer player)
+        {
+            if (_config == null || _config.HouseZone == null || !_config.HouseZone.GangMembersCanOpenDoors) return null;
+            if (player == null || door == null || door.net == null) return null;
+            
+            // Check if this is a grandma house door
+            if (!_storedData.Doors.ContainsKey(door.net.ID.Value)) return null;
+            
+            var doorInfo = _storedData.Doors[door.net.ID.Value];
+            string playerGang = GetPlayerGang(player);
+            
+            // Gang members can always open their gang's doors
+            if (playerGang == doorInfo.GangName)
+            {
+                return true; // Allow gang member to use door
+            }
+            
+            // Enemies cannot open
+            return null; // Let normal lock behavior handle it
+        }
+        
+        // Primary hook for code lock access - this is the correct Rust hook name
+        private object CanUseLockedEntity(BasePlayer player, CodeLock codeLock)
+        {
+            if (_config == null || _config.HouseZone == null || !_config.HouseZone.GangMembersCanOpenDoors) return null;
+            if (player == null || codeLock == null) return null;
+            
+            var door = codeLock.GetParentEntity();
+            if (door == null || door.net == null) return null;
+            
+            // Check if this is a grandma house door
+            if (!_storedData.Doors.ContainsKey(door.net.ID.Value)) return null;
+            
+            var doorInfo = _storedData.Doors[door.net.ID.Value];
+            string playerGang = GetPlayerGang(player);
+            
+            // Gang members can always use their gang's door locks
+            if (playerGang == doorInfo.GangName)
+            {
+                return true;
+            }
+            
+            return null;
+        }
+        
+        // Track door destruction
+        private void OnEntityKill(BaseNetworkable entity)
+        {
+            if (entity == null || entity.net == null) return;
+            
+            var id = entity.net.ID.Value;
+            if (_storedData.Doors.ContainsKey(id))
+            {
+                _storedData.Doors.Remove(id);
+                SaveData();
+            }
+        }
+
+        #endregion
+        
+        #region House Zone & Door Management
+        
+        private GrandmaHouseZone GetHouseZoneAtPosition(Vector3 pos)
+        {
+            foreach (var zone in _storedData.HouseZones.Values)
+            {
+                Vector3 center = new Vector3(zone.CenterX, zone.CenterY, zone.CenterZ);
+                if (Vector3.Distance(pos, center) <= zone.Radius)
+                {
+                    return zone;
+                }
+            }
+            return null;
+        }
+        
+        private string GetPlayerGang(BasePlayer player)
+        {
+            if (HoodWars == null) return "Neutral";
+            var result = HoodWars.Call("GetPlayerGangName", player.userID);
+            return result?.ToString() ?? "Neutral";
+        }
+        
+        private string GetDoorPrefab(string doorType)
+        {
+            switch (doorType?.ToLower())
+            {
+                case "single":
+                case "metal":
+                    return DoorSinglePrefab;
+                case "double":
+                    return DoorDoublePrefab;
+                case "garage":
+                    return DoorGaragePrefab;
+                case "armored_single":
+                case "armored":
+                    return DoorArmoredSinglePrefab;
+                case "armored_double":
+                    return DoorArmoredDoublePrefab;
+                default:
+                    return DoorSinglePrefab;
+            }
+        }
+        
+        private BaseEntity SpawnGrandmaDoor(Vector3 pos, Quaternion rot, string gangName, string doorType, ulong ownerId)
+        {
+            string prefab = GetDoorPrefab(doorType);
+            var door = GameManager.server.CreateEntity(prefab, pos, rot);
+            if (door == null) return null;
+            
+            door.OwnerID = ownerId;
+            
+            // Disable ground watch and decay
+            var gw = door.GetComponent<GroundWatch>();
+            if (gw != null) gw.enabled = false;
+            
+            var stab = door.GetComponent<StabilityEntity>();
+            if (stab != null) stab.grounded = true;
+            
+            if (door is DecayEntity de)
+                de.decay = null;
+            
+            door.Spawn();
+            
+            // Add code lock
+            var codeLock = GameManager.server.CreateEntity(CodeLockPrefab, Vector3.zero, Quaternion.identity) as CodeLock;
+            if (codeLock != null)
+            {
+                codeLock.SetParent(door, "lock");
+                codeLock.OwnerID = ownerId;
+                codeLock.Spawn();
+                // Generate random code
+                codeLock.code = UnityEngine.Random.Range(1000, 9999).ToString();
+                codeLock.SetFlag(BaseEntity.Flags.Locked, true);
+                codeLock.whitelistPlayers.Add(ownerId);
+                codeLock.SendNetworkUpdate();
+            }
+            
+            // Store door info
+            var info = new GrandmaDoorInfo
+            {
+                GangName = gangName,
+                DoorType = doorType,
+                OwnerId = ownerId
+            };
+            info.SetPosition(pos);
+            info.SetRotation(rot);
+            
+            _storedData.Doors[door.net.ID.Value] = info;
+            SaveData();
+            
+            return door;
+        }
+        
+        private void RespawnAllDoors()
+        {
+            var toRespawn = new List<KeyValuePair<ulong, GrandmaDoorInfo>>();
+            
+            foreach (var kvp in _storedData.Doors)
+            {
+                // Use Find for O(1) lookup instead of O(n) LINQ iteration
+                var existingDoor = BaseNetworkable.serverEntities.Find(new NetworkableId(kvp.Key));
+                    
+                if (existingDoor == null)
+                {
+                    toRespawn.Add(kvp);
+                }
+            }
+            
+            foreach (var kvp in toRespawn)
+            {
+                _storedData.Doors.Remove(kvp.Key);
+                var info = kvp.Value;
+                SpawnGrandmaDoor(info.GetPosition(), info.GetRotation(), info.GangName, info.DoorType, info.OwnerId);
+            }
+        }
+        
+        #endregion
+        
+        #region Admin Commands
+        
+        [ChatCommand("grandmazone")]
+        private void CmdGrandmaZone(BasePlayer player, string cmd, string[] args)
+        {
+            if (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                player.ChatMessage("<color=#ff4444>Permission denied.</color>");
+                return;
+            }
+            
+            if (args.Length < 1)
+            {
+                player.ChatMessage("Usage: /grandmazone <create|remove|list|info> [gang_name] [radius]");
+                player.ChatMessage("Example: /grandmazone create \"Westside Pirus\" 30");
+                return;
+            }
+            
+            string action = args[0].ToLower();
+            
+            switch (action)
+            {
+                case "create":
+                    if (args.Length < 2)
+                    {
+                        player.ChatMessage("Usage: /grandmazone create <gang_name> [radius]");
+                        return;
+                    }
+                    string gangName = args[1];
+                    float radius = args.Length >= 3 && float.TryParse(args[2], out float r) ? r : _config.HouseZone.DefaultRadius;
+                    
+                    var zone = new GrandmaHouseZone
+                    {
+                        GangName = gangName,
+                        CenterX = player.transform.position.x,
+                        CenterY = player.transform.position.y,
+                        CenterZ = player.transform.position.z,
+                        Radius = radius,
+                        NoBuild = _config.HouseZone.NoBuildInZone,
+                        AllowRaiding = _config.HouseZone.AllowRaiding
+                    };
+                    
+                    _storedData.HouseZones[gangName] = zone;
+                    SaveData();
+                    
+                    player.ChatMessage($"<color=#55ff55>SUCCESS:</color> Created Grandma's House zone for {gangName} at your position with radius {radius}m");
+                    break;
+                    
+                case "remove":
+                    if (args.Length < 2)
+                    {
+                        player.ChatMessage("Usage: /grandmazone remove <gang_name>");
+                        return;
+                    }
+                    if (_storedData.HouseZones.Remove(args[1]))
+                    {
+                        SaveData();
+                        player.ChatMessage($"<color=#55ff55>SUCCESS:</color> Removed zone for {args[1]}");
+                    }
+                    else
+                    {
+                        player.ChatMessage($"<color=#ff4444>ERROR:</color> No zone found for {args[1]}");
+                    }
+                    break;
+                    
+                case "list":
+                    if (_storedData.HouseZones.Count == 0)
+                    {
+                        player.ChatMessage("No Grandma's House zones defined.");
+                        return;
+                    }
+                    player.ChatMessage("<color=#55ff55>=== Grandma's House Zones ===</color>");
+                    foreach (var z in _storedData.HouseZones.Values)
+                    {
+                        player.ChatMessage($"• {z.GangName}: ({z.CenterX:F0}, {z.CenterZ:F0}) R={z.Radius}m");
+                    }
+                    break;
+                    
+                case "info":
+                    var currentZone = GetHouseZoneAtPosition(player.transform.position);
+                    if (currentZone == null)
+                    {
+                        player.ChatMessage("You are not in any Grandma's House zone.");
+                    }
+                    else
+                    {
+                        player.ChatMessage($"<color=#55ff55>ZONE INFO:</color> {currentZone.GangName}'s Grandma's House");
+                        player.ChatMessage($"Radius: {currentZone.Radius}m | No Build: {currentZone.NoBuild} | Allow Raiding: {currentZone.AllowRaiding}");
+                    }
+                    break;
+                    
+                default:
+                    player.ChatMessage("Unknown action. Use: create, remove, list, or info");
+                    break;
+            }
+        }
+        
+        [ChatCommand("grandmadoor")]
+        private void CmdGrandmaDoor(BasePlayer player, string cmd, string[] args)
+        {
+            if (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                player.ChatMessage("<color=#ff4444>Permission denied.</color>");
+                return;
+            }
+            
+            if (args.Length < 1)
+            {
+                player.ChatMessage("Usage: /grandmadoor <type> [gang_name]");
+                player.ChatMessage("Types: single, double, garage, armored_single, armored_double");
+                player.ChatMessage("If no gang_name, uses the zone you're standing in.");
+                return;
+            }
+            
+            string doorType = args[0].ToLower();
+            string gangName = null;
+            
+            if (args.Length >= 2)
+            {
+                gangName = args[1];
+            }
+            else
+            {
+                var zone = GetHouseZoneAtPosition(player.transform.position);
+                if (zone != null)
+                {
+                    gangName = zone.GangName;
+                }
+            }
+            
+            if (string.IsNullOrEmpty(gangName))
+            {
+                player.ChatMessage("<color=#ff4444>ERROR:</color> You must specify a gang name or stand in a Grandma's House zone.");
+                return;
+            }
+            
+            // Raycast to get spawn position
+            RaycastHit hit;
+            Vector3 spawnPos;
+            Quaternion spawnRot;
+            
+            if (Physics.Raycast(player.eyes.HeadRay(), out hit, 10f))
+            {
+                spawnPos = hit.point;
+                spawnRot = Quaternion.Euler(0, player.viewAngles.y + 180f, 0);
+            }
+            else
+            {
+                spawnPos = player.transform.position + player.transform.forward * 2f;
+                spawnRot = Quaternion.Euler(0, player.viewAngles.y + 180f, 0);
+            }
+            
+            var door = SpawnGrandmaDoor(spawnPos, spawnRot, gangName, doorType, player.userID);
+            if (door != null)
+            {
+                player.ChatMessage($"<color=#55ff55>SUCCESS:</color> Spawned {doorType} door for {gangName}. Gang members can open it without code.");
+            }
+            else
+            {
+                player.ChatMessage("<color=#ff4444>ERROR:</color> Failed to spawn door.");
+            }
+        }
+        
+        [ChatCommand("grandmahelp")]
+        private void CmdGrandmaHelp(BasePlayer player, string cmd, string[] args)
+        {
+            if (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                player.ChatMessage("<color=#ff4444>Permission denied.</color>");
+                return;
+            }
+            
+            player.ChatMessage("<color=#55ff55>=== Grandma's House Commands ===</color>");
+            player.ChatMessage("<color=#ffaa00>Zone Management:</color>");
+            player.ChatMessage("/grandmazone create <gang> [radius] - Create zone at your position");
+            player.ChatMessage("/grandmazone remove <gang> - Remove zone");
+            player.ChatMessage("/grandmazone list - List all zones");
+            player.ChatMessage("/grandmazone info - Info about current zone");
+            player.ChatMessage("");
+            player.ChatMessage("<color=#ffaa00>Door Spawning:</color>");
+            player.ChatMessage("/grandmadoor <type> [gang] - Spawn door (single/double/garage/armored_single/armored_double)");
+            player.ChatMessage("");
+            player.ChatMessage("<color=#ffaa00>Matriarch NPCs:</color>");
+            player.ChatMessage("/gspawn <grandma|mom> - Spawn test matriarch");
+            player.ChatMessage("/gclear - Remove test matriarchs");
         }
 
         #endregion
