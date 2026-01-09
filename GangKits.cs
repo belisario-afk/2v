@@ -1,22 +1,29 @@
 using System.Collections.Generic;
 using System.Linq;
+using Oxide.Core;
 using Oxide.Core.Plugins;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("GangKits", "Gemini", "1.6.0")]
+    [Info("GangKits", "Gemini", "1.8.0")]
     [Description("Automatic permanent gang outfits and weapons. Includes admin testing tools.")]
     public class GangKits : RustPlugin
     {
         // Track gang kit weapons dropped on ground (to clean up)
         private HashSet<uint> _droppedKitItems = new HashSet<uint>();
         
-        // Track which gang each player is blooded into (persists across deaths)
+        // Track which gang each player is blooded into (persists across deaths AND server restarts)
         private Dictionary<ulong, string> _playerGangs = new Dictionary<ulong, string>();
         
         // Track wounded players to prevent kit loss on DBNO (down but not out)
         private HashSet<ulong> _woundedPlayers = new HashSet<ulong>();
+        
+        // Track players currently getting kit (to prevent re-entry)
+        private HashSet<ulong> _givingKit = new HashSet<ulong>();
+        
+        // Data file for persisting player gang assignments
+        private const string DataFileName = "GangKits_PlayerGangs";
         
         [PluginReference]
         private Plugin HoodWars;
@@ -108,6 +115,59 @@ namespace Oxide.Plugins
                     WeaponSkin = ulong.Parse(data["WeaponSkin"].ToString())
                 };
             }
+            
+            // Load saved player gang data
+            LoadPlayerGangData();
+        }
+        
+        private void Unload()
+        {
+            // Save player gang data when plugin unloads
+            SavePlayerGangData();
+        }
+        
+        private void OnServerSave()
+        {
+            // Save player gang data periodically with server saves
+            SavePlayerGangData();
+        }
+        
+        private void LoadPlayerGangData()
+        {
+            try
+            {
+                var data = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, string>>(DataFileName);
+                if (data != null)
+                {
+                    _playerGangs.Clear();
+                    foreach (var kvp in data)
+                    {
+                        if (ulong.TryParse(kvp.Key, out ulong playerId))
+                        {
+                            _playerGangs[playerId] = kvp.Value;
+                        }
+                    }
+                    Puts($"[GangKits] Loaded {_playerGangs.Count} player gang assignments from data file.");
+                }
+            }
+            catch
+            {
+                Puts("[GangKits] No existing player gang data found, starting fresh.");
+            }
+        }
+        
+        private void SavePlayerGangData()
+        {
+            try
+            {
+                var data = _playerGangs.ToDictionary(kvp => kvp.Key.ToString(), kvp => kvp.Value);
+                Interface.Oxide.DataFileSystem.WriteObject(DataFileName, data);
+                Puts($"[GangKits] Saved {_playerGangs.Count} player gang assignments to data file.");
+            }
+            catch (System.Exception ex)
+            {
+                Puts($"[GangKits] ERROR saving player gang data: {ex.Message}");
+            }
         }
 
         #endregion
@@ -121,6 +181,7 @@ namespace Oxide.Plugins
             if (!string.IsNullOrEmpty(gangName) && gangName != "Neutral" && gangName != "Neutral Ground")
             {
                 _playerGangs[playerId] = gangName;
+                SavePlayerGangData(); // Persist immediately
                 Puts($"[DEBUG] Player {playerId} registered to gang: {gangName}");
             }
         }
@@ -140,6 +201,7 @@ namespace Oxide.Plugins
             if (!string.IsNullOrEmpty(gangName) && gangName != "Neutral" && gangName != "Neutral Ground")
             {
                 _playerGangs[player.userID] = gangName;
+                SavePlayerGangData(); // Persist immediately
             }
             
             GiveGangKit(player, gangName);
@@ -147,11 +209,15 @@ namespace Oxide.Plugins
 
         private void GiveGangKit(BasePlayer player, string forcedGang = null)
         {
-            if (player == null) 
+            if (player == null)
             {
                 Puts("[DEBUG] GiveGangKit: player is null, aborting.");
                 return;
             }
+            
+            // Prevent re-entry while giving kit
+            if (_givingKit.Contains(player.userID)) return;
+            _givingKit.Add(player.userID);
 
             string gangName = forcedGang ?? GetPlayerGang(player);
             Puts($"[DEBUG] GiveGangKit: player={player.displayName}, forcedGang={forcedGang ?? "null"}, resolvedGang={gangName}");
@@ -159,12 +225,14 @@ namespace Oxide.Plugins
             if (string.IsNullOrEmpty(gangName) || gangName == "Neutral Ground" || gangName == "Neutral") 
             {
                 Puts($"[DEBUG] GiveGangKit: Gang name is '{gangName}', not a valid gang - aborting.");
+                _givingKit.Remove(player.userID);
                 return;
             }
 
             if (!_kits.TryGetValue(gangName, out var kit)) 
             {
                 Puts($"[DEBUG] GiveGangKit: No kit found for gang '{gangName}'. Available kits: {string.Join(", ", _kits.Keys)}");
+                _givingKit.Remove(player.userID);
                 return;
             }
             
@@ -172,12 +240,20 @@ namespace Oxide.Plugins
             int clothingGiven = 0;
             bool weaponGiven = false;
 
-            // 1. Clothing
+            // 1. Clothing - only give if slot is not occupied by a non-kit item
             foreach (var shortname in kit.Clothing)
             {
-                if (forcedGang == null && IsSlotOccupied(player, shortname)) 
+                // Skip if player has a non-kit item in this slot
+                if (HasNonKitClothing(player, shortname)) 
                 {
-                    Puts($"[DEBUG] Skipping {shortname} - slot already occupied");
+                    Puts($"[DEBUG] Skipping {shortname} - player has non-kit clothing equipped");
+                    continue;
+                }
+                
+                // Skip if player already has this kit item anywhere
+                if (HasGangKitClothing(player, shortname))
+                {
+                    Puts($"[DEBUG] Skipping {shortname} - player already has gang kit clothing");
                     continue;
                 }
 
@@ -191,11 +267,6 @@ namespace Oxide.Plugins
                         clothingGiven++;
                         Puts($"[DEBUG] Gave {shortname} (skin: {skin}) to wear container");
                     }
-                    else if (forcedGang != null && item.MoveToContainer(player.inventory.containerMain))
-                    {
-                        clothingGiven++;
-                        Puts($"[DEBUG] Gave {shortname} (skin: {skin}) to main container (wear was full)");
-                    }
                     else 
                     {
                         item.Remove();
@@ -208,8 +279,8 @@ namespace Oxide.Plugins
                 }
             }
 
-            // 2. Weapon
-            if (forcedGang != null || !HasWeapon(player, kit.Weapon))
+            // 2. Weapon - only give if player doesn't already have it anywhere
+            if (!HasGangKitWeaponAnywhere(player, kit.Weapon))
             {
                 Item weapon = ItemManager.CreateByName(kit.Weapon, 1, kit.WeaponSkin);
                 if (weapon != null)
@@ -227,11 +298,6 @@ namespace Oxide.Plugins
                         weaponGiven = true;
                         Puts($"[DEBUG] Gave weapon {kit.Weapon} (skin: {kit.WeaponSkin}) to belt container");
                     }
-                    else if (forcedGang != null && weapon.MoveToContainer(player.inventory.containerMain))
-                    {
-                        weaponGiven = true;
-                        Puts($"[DEBUG] Gave weapon {kit.Weapon} (skin: {kit.WeaponSkin}) to main container (belt was full)");
-                    }
                     else 
                     {
                         weapon.Remove();
@@ -245,31 +311,36 @@ namespace Oxide.Plugins
             }
             else
             {
-                Puts($"[DEBUG] Skipping weapon - player already has {kit.Weapon}");
+                Puts($"[DEBUG] Skipping weapon - player already has gang kit {kit.Weapon}");
             }
             
             Puts($"[DEBUG] GiveGangKit complete: {clothingGiven} clothing items, weapon: {weaponGiven}");
+            _givingKit.Remove(player.userID);
         }
 
-        private bool IsSlotOccupied(BasePlayer player, string shortname)
+        // Check if player has a non-kit clothing item in a specific slot
+        private bool HasNonKitClothing(BasePlayer player, string shortname)
         {
-            // Check if slot is occupied by a NON-gang-kit item
-            // Gang kit items don't count as "occupied" since they can be replaced
             return player.inventory.containerWear.itemList.Any(item => 
                 item.info.shortname == shortname && item.name != "GANG_KIT_ITEM");
         }
-
-        private bool HasWeapon(BasePlayer player, string shortname)
+        
+        // Check if player has gang kit clothing anywhere (wear or main)
+        private bool HasGangKitClothing(BasePlayer player, string shortname)
         {
-            // Check if player has this weapon (either kit or non-kit version)
-            return player.inventory.containerBelt.itemList.Any(i => i.info.shortname == shortname);
+            return player.inventory.containerWear.itemList.Any(item => 
+                item.info.shortname == shortname && item.name == "GANG_KIT_ITEM") ||
+                player.inventory.containerMain.itemList.Any(item =>
+                item.info.shortname == shortname && item.name == "GANG_KIT_ITEM");
         }
         
-        private bool HasGangKitWeapon(BasePlayer player, string shortname)
+        // Check if player has gang kit weapon anywhere (belt or main)
+        private bool HasGangKitWeaponAnywhere(BasePlayer player, string shortname)
         {
-            // Check if player specifically has a gang kit version of this weapon
-            return player.inventory.containerBelt.itemList.Any(i => 
-                i.info.shortname == shortname && i.name == "GANG_KIT_WEAPON");
+            return player.inventory.containerBelt.itemList.Any(item => 
+                item.info.shortname == shortname && item.name == "GANG_KIT_WEAPON") ||
+                player.inventory.containerMain.itemList.Any(item =>
+                item.info.shortname == shortname && item.name == "GANG_KIT_WEAPON");
         }
 
         private string GetPlayerGang(BasePlayer player)
@@ -317,32 +388,150 @@ namespace Oxide.Plugins
             player.inventory.Strip();
             SendReply(player, "<color=#ffff00>ADMIN:</color> Clearing inventory and spawning all 4 Gang Kits for testing...");
 
-            foreach (var gang in _kits.Keys)
+            // Give all kits directly to main inventory for testing (bypasses normal kit logic)
+            int totalItems = 0;
+            foreach (var kvp in _kits)
             {
-                GiveGangKit(player, gang);
+                string gangName = kvp.Key;
+                GangKit kit = kvp.Value;
+                
+                SendReply(player, $"<color=#aaaaaa>Adding {gangName} kit...</color>");
+                
+                // Add clothing items to main inventory
+                foreach (var shortname in kit.Clothing)
+                {
+                    ulong skin = kit.Skins.ContainsKey(shortname) ? kit.Skins[shortname] : 0;
+                    Item item = ItemManager.CreateByName(shortname, 1, skin);
+                    if (item != null)
+                    {
+                        item.name = $"TEST_{gangName}"; // Mark as test item, not GANG_KIT_ITEM
+                        if (item.MoveToContainer(player.inventory.containerMain))
+                        {
+                            totalItems++;
+                        }
+                        else
+                        {
+                            item.Remove();
+                            Puts($"[DEBUG] CmdTestAllKits: Failed to give {shortname} for {gangName}");
+                        }
+                    }
+                }
+                
+                // Add weapon to main inventory
+                Item weapon = ItemManager.CreateByName(kit.Weapon, 1, kit.WeaponSkin);
+                if (weapon != null)
+                {
+                    weapon.name = $"TEST_{gangName}"; // Mark as test item
+                    BaseProjectile proj = weapon.GetHeldEntity() as BaseProjectile;
+                    if (proj != null)
+                    {
+                        proj.primaryMagazine.contents = 0;
+                        proj.SendNetworkUpdate();
+                    }
+
+                    if (weapon.MoveToContainer(player.inventory.containerMain))
+                    {
+                        totalItems++;
+                    }
+                    else if (weapon.MoveToContainer(player.inventory.containerBelt))
+                    {
+                        totalItems++;
+                    }
+                    else
+                    {
+                        weapon.Remove();
+                        Puts($"[DEBUG] CmdTestAllKits: Failed to give weapon for {gangName}");
+                    }
+                }
             }
             
-            SendReply(player, "Check your inventory. All kits have been spawned.");
+            SendReply(player, $"<color=#66ff66>Done!</color> Spawned {totalItems} items from all 4 gang kits. Check your main inventory.");
         }
 
         #endregion
 
         #region Hooks
 
+        // When player connects to server (includes reconnects)
+        private void OnPlayerConnected(BasePlayer player)
+        {
+            if (player == null) return;
+            Puts($"[DEBUG] OnPlayerConnected: {player.displayName}");
+            
+            // Give kit on connect with a delay to ensure player is fully loaded
+            timer.Once(2f, () => {
+                if (player == null || !player.IsConnected) return;
+                
+                string gangName = GetPlayerGang(player);
+                if (string.IsNullOrEmpty(gangName) || gangName == "Neutral" || gangName == "Neutral Ground")
+                {
+                    Puts($"[DEBUG] OnPlayerConnected: Player {player.displayName} has no gang, skipping kit");
+                    return;
+                }
+                Puts($"[DEBUG] OnPlayerConnected giving kit for gang: {gangName}");
+                GiveGangKit(player);
+            });
+        }
+
         private void OnPlayerRespawned(BasePlayer player)
         {
             if (player == null) return;
             Puts($"[DEBUG] OnPlayerRespawned: {player.displayName}");
             
-            // Clear any existing gang kit items (fresh start)
+            // Always give kit on respawn - this is permanent kit behavior
             timer.Once(0.5f, () => {
                 if (player == null || !player.IsConnected) return;
                 
-                // Force give kit on respawn (true permanent kit behavior)
+                // Give kit on respawn (true permanent kit behavior)
                 string gangName = GetPlayerGang(player);
+                if (string.IsNullOrEmpty(gangName) || gangName == "Neutral" || gangName == "Neutral Ground")
+                {
+                    Puts($"[DEBUG] OnPlayerRespawned: Player {player.displayName} has no gang, skipping kit");
+                    return;
+                }
                 Puts($"[DEBUG] OnPlayerRespawned giving kit for gang: {gangName}");
-                GiveGangKit(player, gangName); // Force give by passing gang name
+                GiveGangKit(player);
             });
+        }
+        
+        // When an item is added to a container - handle kit removal when equipping other clothing
+        private void OnItemAddedToContainer(ItemContainer container, Item item)
+        {
+            BasePlayer player = container.playerOwner;
+            if (player == null || item == null) return;
+            
+            // Only care about wear container
+            if (container != player.inventory.containerWear) return;
+            
+            // If a non-kit clothing item is being equipped, remove any gang kit item of the same type
+            if (item.name != "GANG_KIT_ITEM")
+            {
+                string shortname = item.info.shortname;
+                Puts($"[DEBUG] OnItemAddedToContainer: Non-kit item {shortname} added to wear");
+                
+                // Find and remove gang kit clothing of same type
+                timer.Once(0.1f, () => {
+                    if (player == null || !player.IsConnected) return;
+                    
+                    // Remove from wear
+                    var kitItemInWear = player.inventory.containerWear.itemList
+                        .FirstOrDefault(i => i.info.shortname == shortname && i.name == "GANG_KIT_ITEM" && i != item);
+                    if (kitItemInWear != null)
+                    {
+                        Puts($"[DEBUG] Removing gang kit {shortname} from wear - replaced by non-kit item");
+                        kitItemInWear.Remove();
+                    }
+                    
+                    // Also remove from main if it's there
+                    var kitItemInMain = player.inventory.containerMain.itemList
+                        .FirstOrDefault(i => i.info.shortname == shortname && i.name == "GANG_KIT_ITEM");
+                    if (kitItemInMain != null)
+                    {
+                        Puts($"[DEBUG] Removing gang kit {shortname} from main - player equipped non-kit item");
+                        kitItemInMain.Remove();
+                    }
+                });
+            }
         }
 
         private void OnItemRemovedFromContainer(ItemContainer container, Item item)
@@ -350,22 +539,95 @@ namespace Oxide.Plugins
             BasePlayer player = container.playerOwner;
             if (player == null || item == null) return;
 
-            // Only care about wear and belt containers
-            if (container != player.inventory.containerWear && container != player.inventory.containerBelt)
+            // Only care about wear container for clothing restoration
+            if (container != player.inventory.containerWear)
                 return;
                 
-            // If it's a gang kit item being removed, don't re-trigger kit give immediately
-            // (prevents infinite loops when replacing items)
-            if (item.name == "GANG_KIT_ITEM" || item.name == "GANG_KIT_WEAPON")
+            // If it's a gang kit item being removed, don't re-trigger kit give
+            if (item.name == "GANG_KIT_ITEM")
                 return;
                 
-            Puts($"[DEBUG] OnItemRemovedFromContainer: {item.info.shortname} removed from {(container == player.inventory.containerWear ? "wear" : "belt")}");
+            Puts($"[DEBUG] OnItemRemovedFromContainer: Non-kit {item.info.shortname} removed from wear");
             
-            // Non-kit item removed - check if we need to restore gang kit in that slot
+            // Non-kit clothing item removed - check if we need to restore gang kit in that slot
             timer.Once(0.5f, () => {
                 if (player == null || !player.IsConnected) return;
                 GiveGangKit(player); // Only give missing items
             });
+        }
+        
+        // Prevent gang kit items from being moved to boxes/external storage
+        private object CanMoveItem(Item item, PlayerInventory playerLoot, ItemContainerId targetContainerId, int targetSlot, int amount)
+        {
+            if (item == null) return null;
+            
+            // Check if this is a gang kit item
+            if (item.name == "GANG_KIT_ITEM" || item.name == "GANG_KIT_WEAPON")
+            {
+                // Find the target container
+                ItemContainer targetContainer = playerLoot?.FindContainer(targetContainerId);
+                if (targetContainer == null) return null;
+                
+                BasePlayer player = playerLoot?.baseEntity as BasePlayer;
+                if (player == null) return null;
+                
+                // Allow moving within player's own inventory (belt, main, wear)
+                bool isPlayerContainer = targetContainer == player.inventory.containerMain ||
+                                         targetContainer == player.inventory.containerBelt ||
+                                         targetContainer == player.inventory.containerWear;
+                
+                if (!isPlayerContainer)
+                {
+                    Puts($"[DEBUG] CanMoveItem: Blocking gang kit item {item.info.shortname} from being moved to external storage");
+                    // Send message to player
+                    player.ChatMessage("<color=#ff6666>You cannot put gang kit items in storage.</color>");
+                    return false;
+                }
+            }
+            
+            return null;
+        }
+        
+        // Also block via CanLootEntity hook for dropping into world containers
+        private object CanAcceptItem(ItemContainer container, Item item, int targetPos)
+        {
+            if (item == null || container == null) return null;
+            
+            // Check if this is a gang kit item
+            if (item.name == "GANG_KIT_ITEM" || item.name == "GANG_KIT_WEAPON")
+            {
+                // Check if container belongs to a player's inventory
+                BasePlayer player = container.playerOwner;
+                if (player != null)
+                {
+                    // Allow moving within player's own inventory
+                    bool isPlayerContainer = container == player.inventory.containerMain ||
+                                             container == player.inventory.containerBelt ||
+                                             container == player.inventory.containerWear;
+                    
+                    if (isPlayerContainer) return null;
+                }
+                
+                // Block moving to any other container (boxes, etc)
+                Puts($"[DEBUG] CanAcceptItem: Blocking gang kit item {item.info.shortname} from external container");
+                return ItemContainer.CanAcceptResult.CannotAccept;
+            }
+            
+            return null;
+        }
+        
+        // Block recycling of gang kit items
+        private object CanRecycle(Recycler recycler, Item item)
+        {
+            if (item == null) return null;
+            
+            if (item.name == "GANG_KIT_ITEM" || item.name == "GANG_KIT_WEAPON")
+            {
+                Puts($"[DEBUG] CanRecycle: Blocking gang kit item {item.info.shortname} from recycling");
+                return false;
+            }
+            
+            return null;
         }
 
         // Track when items are dropped on the ground
@@ -396,6 +658,15 @@ namespace Oxide.Plugins
                         entity.Kill();
                     }
                 });
+                
+                // Give back kit to the player who dropped it
+                if (dropper != null && dropper.IsConnected)
+                {
+                    timer.Once(0.2f, () => {
+                        if (dropper == null || !dropper.IsConnected) return;
+                        GiveGangKit(dropper);
+                    });
+                }
             }
         }
 
